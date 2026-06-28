@@ -1,0 +1,32 @@
+import { Registry, collectDefaultMetrics, Counter, Histogram } from 'prom-client';
+
+export const register = new Registry();
+collectDefaultMetrics({ register });
+
+export const httpRequestsTotal = new Counter({
+  name: 'lancamentos_http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'route', 'status'],
+  registers: [register],
+});
+
+export const httpRequestDuration = new Histogram({
+  name: 'lancamentos_http_request_duration_seconds',
+  help: 'HTTP request duration in seconds',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+  registers: [register],
+});
+
+export const lancamentosCreatedTotal = new Counter({
+  name: 'lancamentos_created_total',
+  help: 'Total lancamentos criados com sucesso',
+  labelNames: ['tipo'],
+  registers: [register],
+});
+
+export const outboxEventsPublishedTotal = new Counter({
+  name: 'lancamentos_outbox_events_published_total',
+  help: 'Total eventos publicados pelo outbox relay',
+  registers: [register],
+});
