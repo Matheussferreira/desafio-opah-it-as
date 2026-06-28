@@ -1,0 +1,51 @@
+# Infraestrutura isolada para testes de integração.
+# Portas diferentes do stack principal (5432/5672/6379) para rodar em paralelo sem conflito.
+# O nome de projeto separado (desafio-as-it) evita que o down afete o stack principal.
+# Não use este arquivo manualmente — use o script test-integration.sh que sobe, testa e destrói.
+
+name: desafio-as-it
+
+services:
+  postgres-it:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    ports:
+      - "5433:5432"
+
+  rabbitmq-it:
+    image: rabbitmq:3.13-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbit
+      RABBITMQ_DEFAULT_PASS: rabbit
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    ports:
+      - "5673:5672"
+
+  redis-it:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+    ports:
+      - "6380:6379"
