@@ -234,8 +234,8 @@ Simplificações conscientes, não esquecimentos.
 | RabbitMQ | Single-node | Cluster de 3 nós com quorum queues, sem clustering, morte do broker antes do ack é perda permanente |
 | Publisher confirms | `channel.publish()` marca publicado quando o buffer TCP aceita | `channel.waitForConfirms()` antes de marcar, sem confirms, o broker pode morrer antes de persistir |
 | Redis | Standalone | Redis Sentinel ou ElastiCache Multi-AZ, failover automático elimina o pico de miss após reinício |
-| Outbox relay | `setInterval` de 1s consultando `status='pendente'` | CDC via Debezium lendo o WAL — reage em ~50ms, sem SELECT periódico ao banco |
+| Outbox relay | `setInterval` de 1s consultando `status='pendente'` | CDC via Debezium lendo o WAL e reage em ~50ms, sem SELECT periódico ao banco |
 | Migrações | Rodam no startup do serviço | Passo separado no pipeline de CI/CD antes de qualquer instância nova subir e evita colisão entre pods |
-| Autenticação | JWT com secret em `.env`, endpoint `/auth/login` sem credenciais | OAuth2/OIDC (Cognito, Keycloak) com tokens de curta duração — o endpoint sem credenciais é uma vulnerabilidade em produção |
+| Autenticação | JWT com secret em `.env`, endpoint `/auth/login` sem credenciais | OAuth2/OIDC (Cognito, Keycloak) com tokens de curta duração, o endpoint sem credenciais é uma vulnerabilidade em produção |
 | TLS | HTTP puro | TLS em endpoints públicos; mTLS ou service mesh na comunicação interna |
 | Logs | `pino` para stdout | Coleta com Fluentd/Firehose para CloudWatch Logs com retenção e alertas |
