@@ -1,0 +1,205 @@
+/**
+ * Teste de carga k6 — Fase 4
+ *
+ * PROVA o requisito NF-02:
+ *   "Em dias de pico, o serviço de consolidado recebe 50 req/s,
+ *    com no máximo 5% de perda de requisições."
+ *
+ * Dois cenários rodados em SEQUÊNCIA (não simultâneos):
+ *
+ *   cache_hit  (T=0–60s)  — mesma data repetida → Redis hit após 1ª req.
+ *                            Prova: throughput máximo, caminho quente.
+ *
+ *   cache_miss (T=70–130s) — 60 datas distintas rotacionando.
+ *                            Setup não aquece o cache dessas datas; à época
+ *                            que o cenário inicia (T=70s), o TTL de 60s já
+ *                            expirou para todas as datas verificadas em setup.
+ *                            1ª passagem (≈60 req): Postgres puro.
+ *                            Passagens seguintes: Redis.
+ *                            Prova: Postgres sob 50 req/s, sem perdas.
+ *
+ * Definição de "perda": qualquer resposta ≠ HTTP 200.
+ * Threshold: não_ok_rate < 5% (exit != 0 se violado).
+ * Rate limiter ligado: 6.000 req/min (100 req/s) — teste usa 50% da cota.
+ */
+
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate } from 'k6/metrics';
+import exec from 'k6/execution';
+
+const nonOkRate = new Rate('non_ok_rate');
+
+const TEST_DATE       = __ENV.TEST_DATE       || '2026-06-27';
+const LANCAMENTOS_URL = __ENV.LANCAMENTOS_URL || 'http://localhost:3001';
+const CONSOLIDADO_URL = __ENV.CONSOLIDADO_URL || 'http://localhost:3002';
+
+// 60 datas distintas para o cenário cache_miss.
+// Intervalo escolhido no passado recente (fev–abr 2026): sem conflito com TEST_DATE.
+const CACHE_MISS_DATES = Array.from({ length: 60 }, (_, i) => {
+  const d = new Date('2026-02-01');
+  d.setDate(d.getDate() + i);
+  return d.toISOString().split('T')[0]; // YYYY-MM-DD
+});
+
+export const options = {
+  scenarios: {
+    cache_hit: {
+      executor: 'constant-arrival-rate',
+      rate: 50,
+      timeUnit: '1s',
+      duration: '60s',
+      preAllocatedVUs: 50,  // headroom para pico de latência (max observado ≈600ms → 30 VUs simultâneos)
+      maxVUs: 150,
+      startTime: '0s',
+      exec: 'cacheHitScenario',
+    },
+    cache_miss: {
+      executor: 'constant-arrival-rate',
+      rate: 50,
+      timeUnit: '1s',
+      duration: '60s',
+      preAllocatedVUs: 50,
+      maxVUs: 150,
+      startTime: '70s',  // após cache_hit (60s) + 10s de folga
+      exec: 'cacheMissScenario',
+    },
+  },
+  thresholds: {
+    non_ok_rate:       ['rate<0.05'],
+    http_req_failed:   ['rate<0.05'],
+    http_req_duration: ['p(95)<500'],
+  },
+};
+
+/**
+ * setup() roda UMA VEZ antes de todos os cenários.
+ *   1. JWT via /auth/login
+ *   2. Seed 10 lançamentos em TEST_DATE (cenário cache_hit)
+ *   3. Seed 1 lançamento por data em CACHE_MISS_DATES (cenário cache_miss)
+ *   4. Aguarda 7s de consistência eventual
+ *   5. Verifica TEST_DATE retorna 200 (pré-condição cache_hit)
+ *   6. Verifica amostra das datas cache_miss — apenas 2, sem aquecer as outras 58
+ *      (o TTL de 60s expira antes de T=70s quando cache_miss inicia)
+ */
+export function setup() {
+  // ── 1. JWT ───────────────────────────────────────────────────────────────────
+  const loginRes = http.post(
+    `${LANCAMENTOS_URL}/auth/login`,
+    JSON.stringify({}),
+    { headers: { 'Content-Type': 'application/json' } },
+  );
+  if (loginRes.status !== 200) {
+    throw new Error(`[setup] Login falhou: HTTP ${loginRes.status} — ${loginRes.body}`);
+  }
+  const token = loginRes.json('token');
+  const authHeaders = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  };
+
+  // ── 2. Seed cache_hit ────────────────────────────────────────────────────────
+  console.log(`[setup] Populando ${TEST_DATE} (cache_hit)...`);
+  for (let i = 0; i < 10; i++) {
+    const res = http.post(
+      `${LANCAMENTOS_URL}/lancamentos`,
+      JSON.stringify({
+        valor: 100 + i * 10,
+        tipo: i % 2 === 0 ? 'credito' : 'debito',
+        descricao: `seed-hit-${i}`,
+        data: TEST_DATE,
+      }),
+      { headers: authHeaders },
+    );
+    if (res.status !== 201 && res.status !== 200) {
+      throw new Error(`[setup] Seed cache_hit #${i} falhou: HTTP ${res.status} — ${res.body}`);
+    }
+  }
+
+  // ── 3. Seed cache_miss (60 datas) ────────────────────────────────────────────
+  console.log(`[setup] Populando ${CACHE_MISS_DATES.length} datas (cache_miss)...`);
+  for (let i = 0; i < CACHE_MISS_DATES.length; i++) {
+    const res = http.post(
+      `${LANCAMENTOS_URL}/lancamentos`,
+      JSON.stringify({
+        valor: 200 + i,
+        tipo: 'credito',
+        descricao: `seed-miss-${i}`,
+        data: CACHE_MISS_DATES[i],
+      }),
+      { headers: authHeaders },
+    );
+    if (res.status !== 201 && res.status !== 200) {
+      throw new Error(
+        `[setup] Seed cache_miss #${i} (${CACHE_MISS_DATES[i]}) falhou: HTTP ${res.status} — ${res.body}`,
+      );
+    }
+  }
+
+  // ── 4. Propagação eventual ───────────────────────────────────────────────────
+  console.log('[setup] Aguardando propagação (SLA ≤ 5s; margem: 7s)...');
+  sleep(7);
+
+  // ── 5. Pré-condição cache_hit ────────────────────────────────────────────────
+  const verifyHit = http.get(
+    `${CONSOLIDADO_URL}/consolidado/${TEST_DATE}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (verifyHit.status !== 200) {
+    throw new Error(
+      `[setup] Pré-condição cache_hit falhou: ${TEST_DATE} retornou HTTP ${verifyHit.status}`,
+    );
+  }
+  console.log(`[setup] cache_hit OK → ${verifyHit.body.substring(0, 120)}`);
+
+  // ── 6. Pré-condição cache_miss (amostra: 1ª e última data) ────────────────────
+  // Verifica apenas 2 datas para confirmar propagação sem aquecer as outras 58.
+  // O TTL de 60s expira antes de T=70s, portanto todas as 60 datas estarão
+  // frias (cache miss) quando o cenário cache_miss iniciar.
+  for (const sampleDate of [CACHE_MISS_DATES[0], CACHE_MISS_DATES[CACHE_MISS_DATES.length - 1]]) {
+    const verifyMiss = http.get(
+      `${CONSOLIDADO_URL}/consolidado/${sampleDate}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (verifyMiss.status !== 200) {
+      throw new Error(
+        `[setup] Pré-condição cache_miss falhou: ${sampleDate} retornou HTTP ${verifyMiss.status}`,
+      );
+    }
+    console.log(`[setup] cache_miss sample OK → ${sampleDate}: ${verifyMiss.body.substring(0, 80)}`);
+  }
+
+  return { token };
+}
+
+/** Cenário 1: cache quente — DATA FIXA → Redis hit após 1ª requisição */
+export function cacheHitScenario(data) {
+  const res = http.get(
+    `${CONSOLIDADO_URL}/consolidado/${TEST_DATE}`,
+    { headers: { Authorization: `Bearer ${data.token}` } },
+  );
+  const isOk = res.status === 200;
+  nonOkRate.add(!isOk);
+  check(res, {
+    'HTTP 200': r => r.status === 200,
+    'latência < 500ms': r => r.timings.duration < 500,
+  });
+}
+
+/** Cenário 2: cache miss — DATA VARIÁVEL → rotação entre 60 datas distintas */
+export function cacheMissScenario(data) {
+  const date = CACHE_MISS_DATES[exec.scenario.iterationInTest % CACHE_MISS_DATES.length];
+  const res = http.get(
+    `${CONSOLIDADO_URL}/consolidado/${date}`,
+    { headers: { Authorization: `Bearer ${data.token}` } },
+  );
+  const isOk = res.status === 200;
+  nonOkRate.add(!isOk);
+  check(res, {
+    'HTTP 200': r => r.status === 200,
+    'latência < 500ms': r => r.timings.duration < 500,
+  });
+}
+
+// k6 requer default export; não é chamado quando todos os cenários usam exec: explícito.
+export default function () {}

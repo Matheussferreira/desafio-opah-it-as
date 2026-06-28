@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: lancamentos
+    static_configs:
+      - targets: ['lancamentos:3001']
+    metrics_path: /metrics
+
+  - job_name: consolidado
+    static_configs:
+      - targets: ['consolidado:3002']
+    metrics_path: /metrics
