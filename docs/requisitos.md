@@ -1,0 +1,66 @@
+# Requisitos do Sistema
+
+## Premissa de Fuso Horário
+
+O "dia" de um lançamento é determinado **exclusivamente pelo campo `data` informado pelo cliente**, nunca pelo horário de processamento do evento ou pelo relógio do servidor. O fuso de negócio é **America/Sao_Paulo (UTC-3)**. Todos os containers têm a variável `TZ=America/Sao_Paulo`.
+
+---
+
+## Requisitos Funcionais
+
+### Serviço de Lançamentos
+
+| # | Requisito |
+|---|---|
+| RF-01 | Registrar um lançamento (débito ou crédito) com valor, tipo, descrição opcional e data de competência |
+| RF-02 | Validar que `valor` é positivo, `tipo` é `credito` ou `debito`, e `data` está no formato YYYY-MM-DD |
+| RF-03 | Suportar chave de idempotência do cliente via header `X-Idempotency-Key` (opcional; sem ela, cada request cria um lançamento) |
+| RF-04 | Listar lançamentos com filtro opcional por data de competência |
+| RF-05 | Publicar o evento `LancamentoRegistrado` no broker de forma confiável: o evento é gravado na mesma transação do lançamento (Outbox Pattern), garantindo zero perda mesmo que o broker esteja temporariamente indisponível |
+
+### Serviço de Consolidado
+
+| # | Requisito |
+|---|---|
+| RF-06 | Consumir `LancamentoRegistrado` e atualizar a projeção de saldo diário com upsert atômico (`ON CONFLICT DO UPDATE SET saldo = saldo + delta`) |
+| RF-07 | Garantir idempotência: o mesmo `eventoId` nunca altera o saldo duas vezes, independente de quantas vezes o broker o entregue |
+| RF-08 | Retornar o saldo consolidado de um dia: `total_creditos`, `total_debitos`, `saldo` |
+| RF-09 | Servir saldo do cache Redis com fallback transparente no banco (cliente não percebe o miss) |
+
+---
+
+## Requisitos Não-Funcionais
+
+| # | Requisito | Meta | Como é satisfeito |
+|---|---|---|---|
+| RNF-01 | **Disponibilidade independente** | O Lançamentos responde 2xx mesmo que o Consolidado esteja indisponível | Processos separados; comunicação exclusivamente assíncrona no caminho crítico |
+| RNF-02 | **Throughput** | Consolidado suporta 50 req/s no `GET /consolidado/{data}` | Cache Redis (hit <1ms) + fallback Postgres (1-5ms); rate limiter em 6.000 req/min (100 req/s) não bloqueia a 50 req/s |
+| RNF-03 | **Perda de requisições** | Menos de 5% sob 50 req/s | Rate limiter de 6.000 req/min por IP + cache absorvendo picos |
+| RNF-04 | **Latência** | p95 < 500ms no `GET /consolidado` | Cache hit típico <1ms; miss + Postgres ~5ms; SLO de produção sugerido: p95 < 100ms (cache hit) / p95 < 200ms (miss) |
+| RNF-05 | **Consistência eventual** | Saldo reflete todos os lançamentos em até ~5s após o registro | Outbox relay a cada 1s + propagação AMQP <5ms + processamento do consumer |
+| RNF-06 | **Sem perda de eventos** | Nenhum `LancamentoRegistrado` pode ser perdido | Outbox: evento gravado na transação do lançamento; broker: fila durável; relay: retenta indefinidamente |
+| RNF-07 | **Idempotência** | Redelivery de evento nunca duplica o saldo | `eventos_processados` com `ON CONFLICT DO NOTHING` na mesma transação do upsert de saldo |
+| RNF-08 | **Segurança** | Endpoints de negócio exigem JWT; valores monetários nunca como float | JWT Bearer em todas as rotas protegidas; `NUMERIC(15,2)` no banco; `decimal.js` na aplicação |
+| RNF-09 | **Entrega at-least-once** | O broker pode entregar a mesma mensagem mais de uma vez; o sistema deve ser resiliente a isso | Ver RNF-07; `prefetch=1` por consumer garante ordenação sequencial por processo |
+| RNF-10 | **Graceful shutdown** | O consumer não perde mensagens em processamento ao receber SIGTERM | `stopConsumer()` cancela o consumer tag, aguarda até 8s para in-flight; mensagens novas são requeued durante o shutdown |
+
+---
+
+## Contrato do Evento — Invariantes de Schema
+
+| Campo | Regra |
+|---|---|
+| `eventoId` | UUID v4 único por evento; nunca reutilizado; PK em `eventos_processados` |
+| `schemaVersion` | `"1.0"` para todos os eventos emitidos neste baseline; consumer valida apenas `tipo`, não a versão |
+| `data.valor` | String com valor decimal positivo, 2 casas decimais (ex: `"1500.00"`); **nunca float** |
+| `data.data` | YYYY-MM-DD; define qual linha de `saldo_diario` é afetada |
+
+---
+
+## Rate Limiting e Testes de Carga
+
+O rate limiter do Consolidado está em `6.000 req/min por IP` (100 req/s). O teste de carga k6 a 50 req/s de um único IP opera com 50% da cota — sem gerar `429` em nenhum momento da janela de 60s.
+
+O Lançamentos está em `1.200 req/min por IP` (20 req/s), calibrado para o cenário de integração ERP em lote. Se o teste de carga for aplicado diretamente ao Lançamentos a mais de 20 req/s de um único IP, o rate limiter atuará como esperado. Isso é intencional: escrita é mais cara que leitura e o limite protege o banco de writes.
+
+Os endpoints `/health`, `/ready` e `/metrics` são **isentos** do rate limiter em ambos os serviços — ver [seguranca.md](seguranca.md) para a justificativa.
