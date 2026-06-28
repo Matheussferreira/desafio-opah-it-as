@@ -2,7 +2,7 @@
 
 Dois microsserviços independentes: Lancamentos registra débitos e créditos;
 Consolidado mantém a projeção de saldo diário por data. Eles nunca se comunicam
-diretamente — Lancamentos grava o evento na mesma transação do lançamento (Outbox Pattern)
+diretamente. Lancamentos grava o evento na mesma transação do lançamento (Outbox Pattern)
 e um relay o publica no RabbitMQ; Consolidado consome e aplica um upsert atômico no
 próprio banco.
 
@@ -37,7 +37,7 @@ graph TD
 | Decisão | Escolha | Motivo |
 |---|---|---|
 | Comunicação | RabbitMQ assíncrono | Lançamentos nunca depende do Consolidado estar no ar |
-| Persistência de eventos | Outbox Pattern | Evento gravado na mesma transação do lançamento — zero perda se o broker oscilar |
+| Persistência de eventos | Outbox Pattern | Evento gravado na mesma transação do lançamento, zero perda se o broker oscilar |
 | Idempotência | `eventos_processados` PK | Redelivery não duplica saldo |
 | Concorrência no saldo | Upsert atômico (`ON CONFLICT DO UPDATE`) | Sem race condition com múltiplos consumidores |
 | Valores monetários | `NUMERIC(15,2)` + `decimal.js` | Float binário não representa dinheiro com precisão |
@@ -68,7 +68,7 @@ Portas: lancamentos `:3001`, consolidado `:3002`, RabbitMQ Management `:15672`.
 
 ## Autenticação
 
-O endpoint `/auth/login` devolve um token JWT sem verificar credenciais — existe para
+O endpoint `/auth/login` devolve um token JWT sem verificar credenciais e existe para
 facilitar o teste local. Em produção isso seria substituído por OAuth2.
 
 **bash / zsh:**
@@ -111,7 +111,7 @@ curl -s -X POST http://localhost:3001/lancamentos \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"valor": 350.50, "tipo": "debito", "descricao": "Compra insumos", "data": "2026-06-15"}' | jq
 
-# Com chave de idempotência — reenviar o mesmo X-Idempotency-Key não cria duplicata
+# Com chave de idempotência, reenvia o mesmo X-Idempotency-Key não cria duplicata
 curl -s -X POST http://localhost:3001/lancamentos \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
@@ -156,7 +156,7 @@ Sobe infra isolada (postgres:5433, rabbitmq:5673, redis:6380), roda o teste e de
 Tempo esperado: ~15s.
 
 O que é testado: retry com backoff exponencial, dead-letter após 3 tentativas, e
-processamento válido sem interação com DLQ — tudo contra um broker RabbitMQ real, não mock.
+processamento válido sem interação com DLQ, tudo contra um broker RabbitMQ real, não mock.
 
 ---
 
@@ -180,17 +180,17 @@ Detalhes, thresholds e saída esperada em `tests/load/README.md`.
 # Derruba o Consolidado
 docker compose stop consolidado
 
-# Lançamentos continua respondendo 201 — o isolamento funciona
+# Lançamentos continua respondendo 201, o isolamento funciona
 curl -s -X POST http://localhost:3001/lancamentos \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"valor": 999.00, "tipo": "credito", "descricao": "Teste de isolamento", "data": "2026-06-20"}' | jq
 
-# Sobe o Consolidado — drena a fila automaticamente
+# Sobe o Consolidado, drena a fila automaticamente
 docker compose start consolidado
 sleep 5
 
-# Saldo aparece — consistência eventual
+# Saldo aparece, consistência eventual
 curl -s "http://localhost:3002/consolidado/2026-06-20" \
   -H "Authorization: Bearer $TOKEN" | jq
 ```
@@ -230,12 +230,12 @@ Simplificações conscientes, não esquecimentos.
 
 | Aspecto | Neste desafio | Em produção |
 |---|---|---|
-| Instâncias de banco | `lancamentos_db` e `consolidado_db` no mesmo Postgres | Instâncias separadas (RDS separados) — um banco sobrecarregado não degrada o outro |
-| RabbitMQ | Single-node | Cluster de 3 nós com quorum queues — sem clustering, morte do broker antes do ack é perda permanente |
-| Publisher confirms | `channel.publish()` marca publicado quando o buffer TCP aceita | `channel.waitForConfirms()` antes de marcar — sem confirms, o broker pode morrer antes de persistir |
-| Redis | Standalone | Redis Sentinel ou ElastiCache Multi-AZ — failover automático elimina o pico de miss após reinício |
+| Instâncias de banco | `lancamentos_db` e `consolidado_db` no mesmo Postgres | Instâncias separadas (RDS separados), um banco sobrecarregado não degrada o outro |
+| RabbitMQ | Single-node | Cluster de 3 nós com quorum queues, sem clustering, morte do broker antes do ack é perda permanente |
+| Publisher confirms | `channel.publish()` marca publicado quando o buffer TCP aceita | `channel.waitForConfirms()` antes de marcar, sem confirms, o broker pode morrer antes de persistir |
+| Redis | Standalone | Redis Sentinel ou ElastiCache Multi-AZ, failover automático elimina o pico de miss após reinício |
 | Outbox relay | `setInterval` de 1s consultando `status='pendente'` | CDC via Debezium lendo o WAL — reage em ~50ms, sem SELECT periódico ao banco |
-| Migrações | Rodam no startup do serviço | Passo separado no pipeline de CI/CD antes de qualquer instância nova subir — evita colisão entre pods |
+| Migrações | Rodam no startup do serviço | Passo separado no pipeline de CI/CD antes de qualquer instância nova subir e evita colisão entre pods |
 | Autenticação | JWT com secret em `.env`, endpoint `/auth/login` sem credenciais | OAuth2/OIDC (Cognito, Keycloak) com tokens de curta duração — o endpoint sem credenciais é uma vulnerabilidade em produção |
 | TLS | HTTP puro | TLS em endpoints públicos; mTLS ou service mesh na comunicação interna |
 | Logs | `pino` para stdout | Coleta com Fluentd/Firehose para CloudWatch Logs com retenção e alertas |
