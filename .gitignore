@@ -8,3 +8,5 @@ coverage/
 CLAUDE.md
 .cursor/
 .aider/
+
+body*.json
